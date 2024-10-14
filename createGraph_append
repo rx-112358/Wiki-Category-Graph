@@ -1,0 +1,139 @@
+import requests
+from collections import deque
+import networkx as nx
+from pyspark.sql import SparkSession
+
+def get_wiki_page(title):
+    url = f"https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "titles": title,
+        "prop": "links",
+        "pllimit": "max"
+    }
+    response = requests.get(url, params=params)
+    data = response.json()
+    pages = data["query"]["pages"]
+    return pages
+
+def fetch_links(title):
+    pages = get_wiki_page(title)
+    links = []
+
+    for page_id in pages:
+        if 'links' in pages[page_id]:
+            for link in pages[page_id]['links']:
+                links.append(link['title'])
+
+    return links
+
+def fetch_categories(title):
+    pages = get_wiki_page(title)
+
+    categories = []
+
+    for page_id in pages:
+        if 'links' in pages[page_id]:
+            for link in pages[page_id]['links']:
+                category_title = link['title']
+                category_url = f"https://en.wikipedia.org/w/api.php?action=query&format=json&list=categorymembers&cmtitle={category_title}&cmlimit=max"
+                category_response = requests.get(category_url).json()
+
+                print(link," ", category_response)
+
+                ''' {'error': {'code': 'invalidcategory', 'info': '''
+
+                if "error" not in category_response:
+                    num_pages = len(category_response['query']['categorymembers'])
+                    categories.append((category_title, num_pages))
+
+    return categories
+
+def create_tree(root_title, max_levels=20, max_links_per_page=5, max_categories=5):
+    tree = {}
+    queue = deque([(root_title, 0)])
+    visited = set()
+    cache = {}
+
+    while queue:
+        current_title, level = queue.popleft()
+        if level > max_levels or current_title in visited:
+            continue
+
+        visited.add(current_title)
+        tree[current_title] = []
+
+        if current_title in cache:
+            links = cache[current_title]
+        else:
+            links = fetch_links(current_title)[:max_links_per_page]
+            cache[current_title] = links
+
+        for link_title in links:
+            tree[current_title].append(link_title)
+            queue.append((link_title, level + 1))
+
+        # Fetch and append top categories
+        categories = fetch_categories(current_title)
+        top_categories = sorted(categories, key=lambda x: x, reverse=True)[:max_categories]
+
+        print(categories)
+        
+        for category, _ in top_categories:
+            tree[current_title].append(category)
+
+    return tree
+
+def read_graph_from_lakehouse(file_path):
+
+    # Read the GraphML data from the lakehouse
+    df = spark.read.text(file_path)
+    graphml_data = "\n".join(row.value for row in df.collect())
+
+    # Create a graph from the GraphML data
+    G = nx.parse_graphml(graphml_data)
+
+    return G
+
+def write_graph_to_lakehouse(graph, file_path):
+    
+    graphml_data = '\n'.join(nx.generate_graphml(graph))
+
+    # Write the GraphML data to the lakehouse as a single file
+    df = spark.createDataFrame([(graphml_data,)], ["value"])
+    df.coalesce(1).write.mode("overwrite").format("text").save(file_path)
+
+    print(f"Graph written to {file_path}")
+
+def update_graph_with_links(graph, category, links):
+    if category in graph:
+        for link in links:
+            if link not in graph:
+                graph.add_node(link)
+            if not graph.has_edge(category, link):
+                graph.add_edge(category, link)
+    else:
+        graph.add_node(category)
+        for link in links:
+            graph.add_node(link)
+            graph.add_edge(category, link)
+
+if __name__ == "__main__":
+    root_title = "Category:Main topic classifications"
+    lakehouse_path = test_path
+
+    # Read the existing graph from the lakehouse
+    try:
+        graph = read_graph_from_lakehouse(lakehouse_path)
+    except Exception as e:
+        print(f"Error reading graph: {e}")
+        graph = nx.Graph()
+
+    # Create the tree and update the graph with new links
+    tree = create_tree(root_title)
+    for category, links in tree.items():
+        update_graph_with_links(graph, category, links)
+
+    # Write the updated graph back to the lakehouse
+    write_graph_to_lakehouse(graph, lakehouse_path)
